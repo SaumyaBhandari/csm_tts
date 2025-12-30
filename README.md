@@ -1,106 +1,57 @@
-# CSM TTS - Streaming API
+# CSM TTS Server
 
-Text-to-Speech API using Sesame CSM-1B model with real-time streaming support.
+Standalone Text-to-Speech API using Sesame CSM-1B model.
 
-## Architecture
-
-```
-LLM Response → text chunks → CSM TTS Server → audio chunks → Browser
-```
-
-## Quick Start
-
-```bash
-# Clone and setup
-git clone https://github.com/SaumyaBhandari/csm_tts.git
-cd csm_tts
-python3.10 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-# Login to HuggingFace
-huggingface-cli login
-
-# Run server
-python api_server.py
-```
-
-## API Endpoints
+## API
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/generate` | POST | Single TTS (returns base64) |
-| `/generate/wav` | POST | Single TTS (returns WAV) |
-| `/stream` | WebSocket | **Real-time streaming TTS** |
-| `/stream/chunks` | POST | HTTP streaming for batch |
+| `/generate` | POST | Returns base64 audio |
+| `/generate/wav` | POST | Returns WAV file |
 | `/health` | GET | Health check |
 
-## Streaming with WebSocket
+## Usage
 
-Connect to `/stream` for real-time TTS as your LLM generates text:
+```bash
+# Generate audio (base64)
+curl -X POST http://server:8000/generate \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Hello world"}'
 
-```python
-import websockets
-import json
-import asyncio
+# Generate audio (WAV file)
+curl -X POST http://server:8000/generate/wav \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Hello world"}' \
+  --output speech.wav
+```
 
-async def stream_tts():
-    async with websockets.connect("ws://localhost:8000/stream") as ws:
-        # Send text chunks as they arrive from LLM
-        for chunk in ["Hello,", "how are you?", "I'm doing great!"]:
-            await ws.send(json.dumps({"text": chunk}))
-            
-            # Receive audio immediately
-            response = json.loads(await ws.recv())
-            audio_base64 = response["audio_base64"]
-            # Stream this audio to browser...
-        
-        # Close connection
-        await ws.send(json.dumps({"done": True}))
+## Request Body
 
-asyncio.run(stream_tts())
+```json
+{
+  "text": "Text to speak",
+  "speaker_id": 0,
+  "max_audio_length_ms": 30000,
+  "watermark": true,
+  "watermark_key": [1, 2, 3, 4, 5]
+}
 ```
 
 ## Environment Variables
 
 ```bash
-# .env
-CSM_WATERMARK_KEY=123,456,789,101,202  # Your private key
-CSM_WATERMARK_ENABLED=true             # Default watermark state
-HF_TOKEN=your_token                     # HuggingFace access
+CSM_WATERMARK_KEY=1,2,3,4,5    # Private watermark key
+CSM_WATERMARK_ENABLED=true     # Enable watermark by default
 ```
 
-## Watermarking
-
-Watermark embeds an imperceptible signature in audio for AI-generated content identification.
-
-```json
-// Disable watermark for this request
-{"text": "Hello", "watermark": false}
-
-// Use custom key
-{"text": "Hello", "watermark_key": [1,2,3,4,5]}
-```
-
-## Docker Deployment
+## Deployment
 
 ```bash
-# Build
 docker build -t csm-tts .
-
-# Run with GPU
-docker run --gpus all -p 8000:8000 \
-  -e CSM_WATERMARK_KEY=1,2,3,4,5 \
-  csm-tts
+docker run --gpus all -p 8000:8000 csm-tts
 ```
 
-## Performance
+## Requirements
 
-| Metric | Cold Start | Warm Start |
-|--------|------------|------------|
-| Model Load | ~30-60s | 0s |
-| Per Chunk | ~2-5s | ~2-5s |
-
-## License
-
-Apache-2.0 (see LICENSE)
+- CUDA GPU (A10G, T4, or better)
+- ~4GB GPU memory

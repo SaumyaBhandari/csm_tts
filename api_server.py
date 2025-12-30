@@ -1,11 +1,13 @@
 """
-CSM TTS API Server - Streaming Edition
+CSM TTS API Server
 
-FastAPI server with WebSocket support for real-time streaming TTS.
-As text chunks arrive from your LLM, they're converted to audio and streamed back.
+Standalone TTS server - receives text, returns audio.
+Designed for serverless GPU deployment.
 
-Flow:
-    LLM → text chunks → CSM TTS → audio chunks → Browser
+Endpoints:
+    POST /generate     - Returns base64 audio
+    POST /generate/wav - Returns WAV file directly
+    GET  /health       - Health check
 
 Environment Variables:
     CSM_WATERMARK_KEY: Private watermark key (comma-separated integers)
@@ -15,17 +17,14 @@ import os
 import io
 import base64
 import time
-import asyncio
 from typing import Optional, List
-from contextlib import asynccontextmanager
 
 import torch
 import torchaudio
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import Response, StreamingResponse
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import Response
+from pydantic import BaseModel
 
-# Disable Triton compilation
 os.environ["NO_TORCH_COMPILE"] = "1"
 
 
@@ -33,7 +32,7 @@ os.environ["NO_TORCH_COMPILE"] = "1"
 # Configuration
 # ============================================================================
 
-def get_watermark_key_from_env() -> Optional[List[int]]:
+def get_watermark_key() -> Optional[List[int]]:
     key_str = os.environ.get("CSM_WATERMARK_KEY", "")
     if not key_str:
         return None
@@ -42,19 +41,17 @@ def get_watermark_key_from_env() -> Optional[List[int]]:
     except ValueError:
         return None
 
-ENV_WATERMARK_KEY = get_watermark_key_from_env()
+ENV_WATERMARK_KEY = get_watermark_key()
 ENV_WATERMARK_ENABLED = os.environ.get("CSM_WATERMARK_ENABLED", "true").lower() == "true"
 
-# Global model
 generator = None
 
 
 # ============================================================================
-# Model Loading
+# Model
 # ============================================================================
 
 def load_model():
-    """Load CSM model once (warm start)"""
     global generator
     if generator is not None:
         return generator
@@ -66,36 +63,8 @@ def load_model():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     generator = load_csm_1b(device)
     
-    print(f"Model loaded in {time.time() - start:.2f}s on {device}")
+    print(f"Loaded in {time.time() - start:.1f}s on {device}")
     return generator
-
-
-def generate_audio(
-    text: str,
-    speaker_id: int = 0,
-    max_audio_length_ms: int = 30000,
-    enable_watermark: bool = True,
-    watermark_key: Optional[List[int]] = None
-) -> tuple[bytes, int]:
-    """Generate audio bytes from text"""
-    gen = load_model()
-    
-    audio_tensor = gen.generate(
-        text=text,
-        speaker=speaker_id,
-        context=[],
-        max_audio_length_ms=max_audio_length_ms,
-        temperature=0.9,
-        topk=50,
-        enable_watermark=enable_watermark,
-        watermark_key=watermark_key or ENV_WATERMARK_KEY,
-    )
-    
-    buffer = io.BytesIO()
-    torchaudio.save(buffer, audio_tensor.unsqueeze(0).cpu(), gen.sample_rate, format="wav")
-    buffer.seek(0)
-    
-    return buffer.read(), gen.sample_rate
 
 
 # ============================================================================
@@ -106,7 +75,7 @@ class TTSRequest(BaseModel):
     text: str
     speaker_id: int = 0
     max_audio_length_ms: int = 30000
-    watermark: bool = True
+    watermark: Optional[bool] = None
     watermark_key: Optional[List[int]] = None
 
 
@@ -122,22 +91,12 @@ class TTSResponse(BaseModel):
 # FastAPI App
 # ============================================================================
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    print(f"Watermark default: {ENV_WATERMARK_ENABLED}, key configured: {ENV_WATERMARK_KEY is not None}")
-    yield
-
 app = FastAPI(
-    title="CSM TTS Streaming API",
-    description="Real-time streaming TTS using Sesame CSM-1B",
-    version="2.0.0",
-    lifespan=lifespan
+    title="CSM TTS API",
+    description="Text-to-Speech using Sesame CSM-1B",
+    version="1.0.0"
 )
 
-
-# ============================================================================
-# REST Endpoints
-# ============================================================================
 
 @app.get("/health")
 async def health():
@@ -149,28 +108,38 @@ async def health():
 
 
 @app.post("/generate", response_model=TTSResponse)
-async def generate_speech(req: TTSRequest):
-    """Generate speech from text (single request)"""
+async def generate(req: TTSRequest):
+    """Generate speech from text, returns base64 audio"""
     start = time.time()
     
+    enable_wm = req.watermark if req.watermark is not None else ENV_WATERMARK_ENABLED
+    wm_key = req.watermark_key or ENV_WATERMARK_KEY
+    
     try:
-        audio_bytes, sample_rate = generate_audio(
+        gen = load_model()
+        
+        audio = gen.generate(
             text=req.text,
-            speaker_id=req.speaker_id,
+            speaker=req.speaker_id,
+            context=[],
             max_audio_length_ms=req.max_audio_length_ms,
-            enable_watermark=req.watermark,
-            watermark_key=req.watermark_key
+            temperature=0.9,
+            topk=50,
+            enable_watermark=enable_wm,
+            watermark_key=wm_key,
         )
         
-        # Calculate duration from WAV header (sample count)
-        gen = load_model()
+        buf = io.BytesIO()
+        torchaudio.save(buf, audio.unsqueeze(0).cpu(), gen.sample_rate, format="wav")
+        buf.seek(0)
+        audio_bytes = buf.read()
         
         return TTSResponse(
             audio_base64=base64.b64encode(audio_bytes).decode(),
-            sample_rate=sample_rate,
-            duration_ms=len(audio_bytes) / sample_rate * 1000 / 4,  # Approximate
+            sample_rate=gen.sample_rate,
+            duration_ms=(len(audio) / gen.sample_rate) * 1000,
             processing_time_ms=(time.time() - start) * 1000,
-            watermarked=req.watermark
+            watermarked=enable_wm
         )
     except Exception as e:
         raise HTTPException(500, str(e))
@@ -178,157 +147,41 @@ async def generate_speech(req: TTSRequest):
 
 @app.post("/generate/wav")
 async def generate_wav(req: TTSRequest):
-    """Generate speech and return raw WAV file"""
+    """Generate speech from text, returns WAV file"""
+    enable_wm = req.watermark if req.watermark is not None else ENV_WATERMARK_ENABLED
+    wm_key = req.watermark_key or ENV_WATERMARK_KEY
+    
     try:
-        audio_bytes, _ = generate_audio(
+        gen = load_model()
+        
+        audio = gen.generate(
             text=req.text,
-            speaker_id=req.speaker_id,
+            speaker=req.speaker_id,
+            context=[],
             max_audio_length_ms=req.max_audio_length_ms,
-            enable_watermark=req.watermark,
-            watermark_key=req.watermark_key
+            temperature=0.9,
+            topk=50,
+            enable_watermark=enable_wm,
+            watermark_key=wm_key,
         )
-        return Response(content=audio_bytes, media_type="audio/wav")
+        
+        buf = io.BytesIO()
+        torchaudio.save(buf, audio.unsqueeze(0).cpu(), gen.sample_rate, format="wav")
+        buf.seek(0)
+        
+        return Response(content=buf.read(), media_type="audio/wav")
     except Exception as e:
         raise HTTPException(500, str(e))
-
-
-# ============================================================================
-# WebSocket Streaming Endpoint
-# ============================================================================
-
-@app.websocket("/stream")
-async def websocket_stream(websocket: WebSocket):
-    """
-    WebSocket endpoint for streaming TTS.
-    
-    Protocol:
-    1. Client connects
-    2. Client sends JSON: {"text": "chunk of text", "speaker_id": 0, "watermark": true}
-    3. Server responds with: {"audio_base64": "...", "sample_rate": 24000}
-    4. Repeat for each text chunk
-    5. Client sends: {"done": true} to close
-    
-    Example (from main backend):
-        async with websockets.connect("ws://csm-server/stream") as ws:
-            for chunk in llm_response_chunks:
-                await ws.send(json.dumps({"text": chunk}))
-                response = await ws.recv()
-                audio_data = json.loads(response)["audio_base64"]
-                # Stream audio to browser
-    """
-    await websocket.accept()
-    print("Streaming client connected")
-    
-    # Ensure model is loaded on first connection
-    load_model()
-    
-    try:
-        while True:
-            # Receive text chunk
-            data = await websocket.receive_json()
-            
-            # Check for done signal
-            if data.get("done"):
-                await websocket.send_json({"status": "closed"})
-                break
-            
-            text = data.get("text", "")
-            if not text:
-                await websocket.send_json({"error": "No text provided"})
-                continue
-            
-            # Extract options
-            speaker_id = data.get("speaker_id", 0)
-            max_audio_length_ms = data.get("max_audio_length_ms", 30000)
-            enable_watermark = data.get("watermark", ENV_WATERMARK_ENABLED)
-            watermark_key = data.get("watermark_key", ENV_WATERMARK_KEY)
-            
-            start = time.time()
-            
-            try:
-                # Generate audio for this chunk
-                audio_bytes, sample_rate = generate_audio(
-                    text=text,
-                    speaker_id=speaker_id,
-                    max_audio_length_ms=max_audio_length_ms,
-                    enable_watermark=enable_watermark,
-                    watermark_key=watermark_key
-                )
-                
-                # Send audio back
-                await websocket.send_json({
-                    "audio_base64": base64.b64encode(audio_bytes).decode(),
-                    "sample_rate": sample_rate,
-                    "processing_time_ms": (time.time() - start) * 1000,
-                    "text": text  # Echo back the text for syncing
-                })
-                
-            except Exception as e:
-                await websocket.send_json({"error": str(e), "text": text})
-                
-    except WebSocketDisconnect:
-        print("Streaming client disconnected")
-    except Exception as e:
-        print(f"WebSocket error: {e}")
-
-
-# ============================================================================
-# HTTP Streaming Endpoint (Alternative to WebSocket)
-# ============================================================================
-
-@app.post("/stream/chunks")
-async def stream_chunks(texts: List[str], speaker_id: int = 0, watermark: bool = True):
-    """
-    Stream audio for multiple text chunks.
-    
-    Request body: List of text strings
-    Response: Streaming audio chunks as newline-delimited JSON
-    
-    Example:
-        curl -X POST /stream/chunks 
-             -H "Content-Type: application/json"
-             -d '["Hello,", "how are you?", "I am fine."]'
-    """
-    async def generate_stream():
-        for text in texts:
-            if not text.strip():
-                continue
-            
-            try:
-                audio_bytes, sample_rate = generate_audio(
-                    text=text,
-                    speaker_id=speaker_id,
-                    enable_watermark=watermark,
-                    watermark_key=ENV_WATERMARK_KEY
-                )
-                
-                chunk = {
-                    "text": text,
-                    "audio_base64": base64.b64encode(audio_bytes).decode(),
-                    "sample_rate": sample_rate
-                }
-                yield f"{__import__('json').dumps(chunk)}\n"
-                
-            except Exception as e:
-                yield f'{{"error": "{str(e)}", "text": "{text}"}}\n'
-    
-    return StreamingResponse(
-        generate_stream(),
-        media_type="application/x-ndjson"
-    )
 
 
 @app.get("/")
 async def root():
     return {
-        "name": "CSM TTS Streaming API",
-        "version": "2.0.0",
+        "name": "CSM TTS API",
         "endpoints": {
-            "/health": "Health check",
-            "/generate": "Single TTS request (base64)",
-            "/generate/wav": "Single TTS request (WAV file)",
-            "/stream": "WebSocket streaming TTS",
-            "/stream/chunks": "HTTP streaming for batch chunks"
+            "/generate": "POST - Returns base64 audio",
+            "/generate/wav": "POST - Returns WAV file",
+            "/health": "GET - Health check"
         }
     }
 

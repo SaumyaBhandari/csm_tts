@@ -1,16 +1,17 @@
 # CSM TTS Requirements
-torch==2.4.0
-torchaudio==2.4.0
-tokenizers==0.21.0
-transformers==4.49.0
-huggingface_hub==0.28.1
-moshi==0.2.2
-torchtune==0.4.0
-torchao==0.9.0
+# NOTE: Requires CUDA GPU
+
+torch>=2.4.0
+torchaudio>=2.4.0
+tokenizers>=0.21.0
+transformers>=4.49.0
+huggingface_hub>=0.28.1
+moshi>=0.2.2
+torchtune>=0.4.0
+torchao>=0.9.0
 silentcipher @ git+https://github.com/SesameAILabs/silentcipher@master
 
 # API Server
 fastapi>=0.109.0
 uvicorn[standard]>=0.27.0
 pydantic>=2.0.0
-websockets>=12.0
