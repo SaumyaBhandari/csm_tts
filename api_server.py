@@ -3,6 +3,10 @@ CSM TTS API Server
 
 FastAPI server that exposes the CSM (Conversational Speech Model) as an HTTP API.
 Designed for serverless GPU deployment (auto-scale, warm-start on request).
+
+Environment Variables:
+    CSM_WATERMARK_KEY: Private watermark key as comma-separated integers (e.g., "1,2,3,4,5")
+    CSM_WATERMARK_ENABLED: Default watermark state ("true" or "false", default: "true")
 """
 import os
 import io
@@ -15,10 +19,30 @@ import torch
 import torchaudio
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # Disable Triton compilation for serverless compatibility
 os.environ["NO_TORCH_COMPILE"] = "1"
+
+# Load environment configuration
+def get_watermark_key_from_env() -> Optional[List[int]]:
+    """Load private watermark key from environment variable."""
+    key_str = os.environ.get("CSM_WATERMARK_KEY", "")
+    if not key_str:
+        return None
+    try:
+        return [int(x.strip()) for x in key_str.split(",")]
+    except ValueError:
+        print(f"WARNING: Invalid CSM_WATERMARK_KEY format: {key_str}")
+        return None
+
+def get_default_watermark_enabled() -> bool:
+    """Get default watermark enabled state from environment."""
+    return os.environ.get("CSM_WATERMARK_ENABLED", "true").lower() == "true"
+
+# Environment-based configuration
+ENV_WATERMARK_KEY = get_watermark_key_from_env()
+ENV_WATERMARK_ENABLED = get_default_watermark_enabled()
 
 # Global generator instance (warm-start after first load)
 generator = None
@@ -32,6 +56,15 @@ class TTSRequest(BaseModel):
     max_audio_length_ms: int = 30000
     temperature: float = 0.9
     topk: int = 50
+    # Watermark options
+    watermark: Optional[bool] = Field(
+        default=None, 
+        description="Enable/disable watermark. If not provided, uses server default (CSM_WATERMARK_ENABLED env var)"
+    )
+    watermark_key: Optional[List[int]] = Field(
+        default=None,
+        description="Custom watermark key (5 integers). If not provided, uses server's private key (CSM_WATERMARK_KEY env var)"
+    )
 
 
 class TTSResponse(BaseModel):
@@ -40,6 +73,7 @@ class TTSResponse(BaseModel):
     sample_rate: int
     duration_ms: float
     processing_time_ms: float
+    watermarked: bool
 
 
 class HealthResponse(BaseModel):
@@ -48,6 +82,8 @@ class HealthResponse(BaseModel):
     model_loaded: bool
     device: str
     last_request_time: Optional[float]
+    watermark_enabled_default: bool
+    watermark_key_configured: bool
 
 
 def load_model():
@@ -78,18 +114,18 @@ def load_model():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup/shutdown"""
-    # Startup: Optionally pre-load model (comment out for cold-start)
-    # load_model()
+    # Log configuration on startup
+    print(f"Watermark enabled by default: {ENV_WATERMARK_ENABLED}")
+    print(f"Private watermark key configured: {ENV_WATERMARK_KEY is not None}")
     yield
-    # Shutdown: cleanup if needed
     pass
 
 
 # Create FastAPI app
 app = FastAPI(
     title="CSM TTS API",
-    description="Text-to-Speech API using Sesame CSM-1B model",
-    version="1.0.0",
+    description="Text-to-Speech API using Sesame CSM-1B model with optional watermarking",
+    version="1.1.0",
     lifespan=lifespan
 )
 
@@ -111,7 +147,9 @@ async def health_check():
         status="healthy",
         model_loaded=generator is not None,
         device=device,
-        last_request_time=last_request_time
+        last_request_time=last_request_time,
+        watermark_enabled_default=ENV_WATERMARK_ENABLED,
+        watermark_key_configured=ENV_WATERMARK_KEY is not None
     )
 
 
@@ -122,17 +160,25 @@ async def generate_speech(request: TTSRequest):
     
     First request will load the model (cold start ~30-60s).
     Subsequent requests use warm model (~1-3s).
+    
+    Watermark options:
+    - watermark: true/false to enable/disable (default: server config)
+    - watermark_key: custom 5-integer key (default: server's private key)
     """
     global generator, last_request_time
     
     start_time = time.time()
     last_request_time = start_time
     
+    # Resolve watermark settings
+    enable_watermark = request.watermark if request.watermark is not None else ENV_WATERMARK_ENABLED
+    watermark_key = request.watermark_key if request.watermark_key is not None else ENV_WATERMARK_KEY
+    
     try:
         # Load model if not already loaded (warm start)
         gen = load_model()
         
-        # Generate audio
+        # Generate audio with watermark options
         audio_tensor = gen.generate(
             text=request.text,
             speaker=request.speaker_id,
@@ -140,6 +186,8 @@ async def generate_speech(request: TTSRequest):
             max_audio_length_ms=request.max_audio_length_ms,
             temperature=request.temperature,
             topk=request.topk,
+            enable_watermark=enable_watermark,
+            watermark_key=watermark_key,
         )
         
         # Convert to WAV bytes
@@ -161,7 +209,8 @@ async def generate_speech(request: TTSRequest):
             audio_base64=base64.b64encode(audio_bytes).decode("utf-8"),
             sample_rate=gen.sample_rate,
             duration_ms=duration_ms,
-            processing_time_ms=processing_time_ms
+            processing_time_ms=processing_time_ms,
+            watermarked=enable_watermark
         )
         
     except Exception as e:
@@ -178,6 +227,10 @@ async def generate_speech_wav(request: TTSRequest):
     
     last_request_time = time.time()
     
+    # Resolve watermark settings
+    enable_watermark = request.watermark if request.watermark is not None else ENV_WATERMARK_ENABLED
+    watermark_key = request.watermark_key if request.watermark_key is not None else ENV_WATERMARK_KEY
+    
     try:
         gen = load_model()
         
@@ -188,6 +241,8 @@ async def generate_speech_wav(request: TTSRequest):
             max_audio_length_ms=request.max_audio_length_ms,
             temperature=request.temperature,
             topk=request.topk,
+            enable_watermark=enable_watermark,
+            watermark_key=watermark_key,
         )
         
         buffer = io.BytesIO()
@@ -203,7 +258,8 @@ async def generate_speech_wav(request: TTSRequest):
             content=buffer.read(),
             media_type="audio/wav",
             headers={
-                "Content-Disposition": "attachment; filename=speech.wav"
+                "Content-Disposition": "attachment; filename=speech.wav",
+                "X-Watermarked": str(enable_watermark).lower()
             }
         )
         
@@ -216,11 +272,15 @@ async def root():
     """Root endpoint with API info"""
     return {
         "name": "CSM TTS API",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "endpoints": {
             "/health": "Health check",
             "/generate": "Generate speech (returns base64)",
             "/generate/wav": "Generate speech (returns WAV file)"
+        },
+        "watermark": {
+            "enabled_default": ENV_WATERMARK_ENABLED,
+            "private_key_configured": ENV_WATERMARK_KEY is not None
         }
     }
 

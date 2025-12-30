@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import torch
 import torchaudio
@@ -114,6 +114,8 @@ class Generator:
         max_audio_length_ms: float = 90_000,
         temperature: float = 0.9,
         topk: int = 50,
+        enable_watermark: bool = True,
+        watermark_key: Optional[List[int]] = None,
     ) -> torch.Tensor:
         self._model.reset_caches()
 
@@ -158,12 +160,13 @@ class Generator:
 
         audio = self._audio_tokenizer.decode(torch.stack(samples).permute(1, 2, 0)).squeeze(0).squeeze(0)
 
-        # This applies an imperceptible watermark to identify audio as AI-generated.
+        # Apply watermark if enabled
         # Watermarking ensures transparency, dissuades misuse, and enables traceability.
-        # Please be a responsible AI citizen and keep the watermarking in place.
-        # If using CSM 1B in another application, use your own private key and keep it secret.
-        audio, wm_sample_rate = watermark(self._watermarker, audio, self.sample_rate, CSM_1B_GH_WATERMARK)
-        audio = torchaudio.functional.resample(audio, orig_freq=wm_sample_rate, new_freq=self.sample_rate)
+        if enable_watermark:
+            # Use custom key if provided, otherwise use default CSM key
+            key = watermark_key if watermark_key is not None else CSM_1B_GH_WATERMARK
+            audio, wm_sample_rate = watermark(self._watermarker, audio, self.sample_rate, key)
+            audio = torchaudio.functional.resample(audio, orig_freq=wm_sample_rate, new_freq=self.sample_rate)
 
         return audio
 
