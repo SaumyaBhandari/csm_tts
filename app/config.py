@@ -17,7 +17,7 @@ class Settings:
         self.port: int = int(os.getenv("PORT", "8000"))
         
         # Model
-        self.model_device: str = os.getenv("MODEL_DEVICE", "auto")  # auto, cuda, cpu
+        self.model_device: str = os.getenv("MODEL_DEVICE", "auto")  
         
         # Watermark
         self.watermark_enabled: bool = os.getenv("CSM_WATERMARK_ENABLED", "true").lower() == "true"
